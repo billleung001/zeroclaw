@@ -120,7 +120,9 @@ enum Commands {
         /// Provider name (used in quick mode, default: openrouter)
         #[arg(long)]
         provider: Option<String>,
-
+        /// Model ID override (used in quick mode)
+        #[arg(long)]
+        model: Option<String>,
         /// Memory backend (sqlite, lucid, markdown, none) - used in quick mode, default: sqlite
         #[arg(long)]
         memory: Option<String>,
@@ -532,6 +534,7 @@ async fn main() -> Result<()> {
         channels_only,
         api_key,
         provider,
+        model,
         memory,
     } = &cli.command
     {
@@ -539,25 +542,30 @@ async fn main() -> Result<()> {
         let channels_only = *channels_only;
         let api_key = api_key.clone();
         let provider = provider.clone();
+        let model = model.clone();
         let memory = memory.clone();
 
         if interactive && channels_only {
             bail!("Use either --interactive or --channels-only, not both");
         }
-        if channels_only && (api_key.is_some() || provider.is_some() || memory.is_some()) {
-            bail!("--channels-only does not accept --api-key, --provider, or --memory");
+        if channels_only
+            && (api_key.is_some() || provider.is_some() || model.is_some() || memory.is_some())
+        {
+            bail!("--channels-only does not accept --api-key, --provider, --model, or --memory");
         }
-
-        let config = tokio::task::spawn_blocking(move || {
-            if channels_only {
-                onboard::run_channels_repair_wizard()
-            } else if interactive {
-                onboard::run_wizard()
-            } else {
-                onboard::run_quick_setup(api_key.as_deref(), provider.as_deref(), memory.as_deref())
-            }
-        })
-        .await??;
+        let config = if channels_only {
+            onboard::run_channels_repair_wizard().await
+        } else if interactive {
+            onboard::run_wizard().await
+        } else {
+            onboard::run_quick_setup(
+                api_key.as_deref(),
+                provider.as_deref(),
+                model.as_deref(),
+                memory.as_deref(),
+            )
+            .await
+        }?;
         // Auto-start channels if user said yes during wizard
         if std::env::var("ZEROCLAW_AUTOSTART_CHANNELS").as_deref() == Ok("1") {
             channels::start_channels(config).await?;
@@ -566,7 +574,7 @@ async fn main() -> Result<()> {
     }
 
     // All other commands need config loaded first
-    let mut config = Config::load_or_init()?;
+    let mut config = Config::load_or_init().await?;
     config.apply_env_overrides();
 
     match cli.command {
@@ -754,7 +762,7 @@ async fn main() -> Result<()> {
         Commands::Channel { channel_command } => match channel_command {
             ChannelCommands::Start => channels::start_channels(config).await,
             ChannelCommands::Doctor => channels::doctor_channels(config).await,
-            other => channels::handle_command(other, &config),
+            other => channels::handle_command(other, &config).await,
         },
 
         Commands::Integrations {
@@ -776,7 +784,7 @@ async fn main() -> Result<()> {
         }
 
         Commands::Peripheral { peripheral_command } => {
-            peripherals::handle_command(peripheral_command.clone(), &config)
+            peripherals::handle_command(peripheral_command.clone(), &config).await
         }
 
         Commands::Config { config_command } => match config_command {

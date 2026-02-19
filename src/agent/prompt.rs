@@ -215,7 +215,8 @@ impl PromptSection for DateTimeSection {
     fn build(&self, _ctx: &PromptContext<'_>) -> Result<String> {
         let now = Local::now();
         Ok(format!(
-            "## Current Date & Time\n\nTimezone: {}",
+            "## Current Date & Time\n\n{} ({})",
+            now.format("%Y-%m-%d %H:%M:%S"),
             now.format("%Z")
         ))
     }
@@ -346,5 +347,26 @@ mod tests {
         assert!(prompt.contains("## Tools"));
         assert!(prompt.contains("test_tool"));
         assert!(prompt.contains("instr"));
+    }
+
+    #[test]
+    fn datetime_section_includes_timestamp_and_timezone() {
+        let tools: Vec<Box<dyn Tool>> = vec![];
+        let ctx = PromptContext {
+            workspace_dir: Path::new("/tmp"),
+            model_name: "test-model",
+            tools: &tools,
+            skills: &[],
+            identity_config: None,
+            dispatcher_instructions: "instr",
+        };
+
+        let rendered = DateTimeSection.build(&ctx).unwrap();
+        assert!(rendered.starts_with("## Current Date & Time\n\n"));
+
+        let payload = rendered.trim_start_matches("## Current Date & Time\n\n");
+        assert!(payload.chars().any(|c| c.is_ascii_digit()));
+        assert!(payload.contains(" ("));
+        assert!(payload.ends_with(')'));
     }
 }

@@ -367,12 +367,16 @@ pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
         });
 
     // WhatsApp channel (if configured)
-    let whatsapp_channel: Option<Arc<WhatsAppChannel>> =
-        config.channels_config.whatsapp.as_ref().map(|wa| {
+    let whatsapp_channel: Option<Arc<WhatsAppChannel>> = config
+        .channels_config
+        .whatsapp
+        .as_ref()
+        .filter(|wa| wa.is_cloud_config())
+        .map(|wa| {
             Arc::new(WhatsAppChannel::new(
-                wa.access_token.clone(),
-                wa.phone_number_id.clone(),
-                wa.verify_token.clone(),
+                wa.access_token.clone().unwrap_or_default(),
+                wa.phone_number_id.clone().unwrap_or_default(),
+                wa.verify_token.clone().unwrap_or_default(),
                 wa.allowed_numbers.clone(),
             ))
         });
@@ -583,6 +587,7 @@ async fn handle_metrics(State(state): State<AppState>) -> impl IntoResponse {
 }
 
 /// POST /pair — exchange one-time code for bearer token
+#[axum::debug_handler]
 async fn handle_pair(
     State(state): State<AppState>,
     ConnectInfo(peer_addr): ConnectInfo<SocketAddr>,
@@ -604,10 +609,10 @@ async fn handle_pair(
         .and_then(|v| v.to_str().ok())
         .unwrap_or("");
 
-    match state.pairing.try_pair(code) {
+    match state.pairing.try_pair(code).await {
         Ok(Some(token)) => {
             tracing::info!("🔐 New client paired successfully");
-            if let Err(err) = persist_pairing_tokens(&state.config, &state.pairing) {
+            if let Err(err) = persist_pairing_tokens(state.config.clone(), &state.pairing).await {
                 tracing::error!("🔐 Pairing succeeded but token persistence failed: {err:#}");
                 let body = serde_json::json!({
                     "paired": true,
@@ -644,12 +649,20 @@ async fn handle_pair(
     }
 }
 
-fn persist_pairing_tokens(config: &Arc<Mutex<Config>>, pairing: &PairingGuard) -> Result<()> {
+async fn persist_pairing_tokens(config: Arc<Mutex<Config>>, pairing: &PairingGuard) -> Result<()> {
     let paired_tokens = pairing.tokens();
-    let mut cfg = config.lock();
-    cfg.gateway.paired_tokens = paired_tokens;
-    cfg.save()
-        .context("Failed to persist paired tokens to config.toml")
+    // This is needed because parking_lot's guard is not Send so we clone the inner
+    // this should be removed once async mutexes are used everywhere
+    let mut updated_cfg = { config.lock().clone() };
+    updated_cfg.gateway.paired_tokens = paired_tokens;
+    updated_cfg
+        .save()
+        .await
+        .context("Failed to persist paired tokens to config.toml")?;
+
+    // Keep shared runtime config in sync with persisted tokens.
+    *config.lock() = updated_cfg;
+    Ok(())
 }
 
 /// Webhook request body
@@ -1194,6 +1207,8 @@ mod tests {
             idempotency_store: Arc::new(IdempotencyStore::new(Duration::from_secs(300), 1000)),
             whatsapp: None,
             whatsapp_app_secret: None,
+            linq: None,
+            linq_signing_secret: None,
             observer: Arc::new(crate::observability::NoopObserver),
         };
 
@@ -1235,6 +1250,8 @@ mod tests {
             idempotency_store: Arc::new(IdempotencyStore::new(Duration::from_secs(300), 1000)),
             whatsapp: None,
             whatsapp_app_secret: None,
+            linq: None,
+            linq_signing_secret: None,
             observer,
         };
 
@@ -1390,15 +1407,17 @@ mod tests {
         let mut config = Config::default();
         config.config_path = config_path.clone();
         config.workspace_dir = workspace_path;
-        config.save().unwrap();
+        config.save().await.unwrap();
 
         let guard = PairingGuard::new(true, &[]);
         let code = guard.pairing_code().unwrap();
-        let token = guard.try_pair(&code).unwrap().unwrap();
+        let token = guard.try_pair(&code).await.unwrap().unwrap();
         assert!(guard.is_authenticated(&token));
 
         let shared_config = Arc::new(Mutex::new(config));
-        persist_pairing_tokens(&shared_config, &guard).unwrap();
+        persist_pairing_tokens(shared_config.clone(), &guard)
+            .await
+            .unwrap();
 
         let saved = tokio::fs::read_to_string(config_path).await.unwrap();
         let parsed: Config = toml::from_str(&saved).unwrap();
@@ -1406,6 +1425,10 @@ mod tests {
         let persisted = &parsed.gateway.paired_tokens[0];
         assert_eq!(persisted.len(), 64);
         assert!(persisted.chars().all(|c| c.is_ascii_hexdigit()));
+
+        let in_memory = shared_config.lock();
+        assert_eq!(in_memory.gateway.paired_tokens.len(), 1);
+        assert_eq!(&in_memory.gateway.paired_tokens[0], persisted);
     }
 
     #[test]
@@ -1427,6 +1450,7 @@ mod tests {
             content: "hello".into(),
             channel: "whatsapp".into(),
             timestamp: 1,
+            thread_ts: None,
         };
 
         let key = whatsapp_memory_key(&msg);
@@ -1809,10 +1833,7 @@ mod tests {
         };
 
         let mut headers = HeaderMap::new();
-        headers.insert(
-            "X-Webhook-Secret",
-            HeaderValue::from_str(&secret).unwrap(),
-        );
+        headers.insert("X-Webhook-Secret", HeaderValue::from_str(&secret).unwrap());
 
         let response = handle_webhook(
             State(state),
@@ -1984,7 +2005,11 @@ mod tests {
 
         // Correct prefix should pass
         let correct_prefix = format!("sha256={hex_sig}");
-        assert!(verify_whatsapp_signature(&app_secret, body, &correct_prefix));
+        assert!(verify_whatsapp_signature(
+            &app_secret,
+            body,
+            &correct_prefix
+        ));
     }
 
     #[test]
