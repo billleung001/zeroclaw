@@ -648,7 +648,7 @@ impl Default for GatewayConfig {
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct ComposioConfig {
     /// Enable Composio integration for 1000+ OAuth tools
-    #[serde(default)]
+    #[serde(default, alias = "enable")]
     pub enabled: bool,
     /// Composio API key (stored encrypted when secrets.encrypt = true)
     #[serde(default)]
@@ -1387,7 +1387,7 @@ pub struct MemoryConfig {
     ///
     /// `postgres` requires `[storage.provider.config]` with `db_url` (`dbURL` alias supported).
     pub backend: String,
-    /// Auto-save conversation context to memory
+    /// Auto-save user-stated conversation input to memory (assistant output is excluded)
     pub auto_save: bool,
     /// Run memory/session hygiene (archiving + retention cleanup)
     #[serde(default = "default_hygiene_enabled")]
@@ -2125,6 +2125,10 @@ pub struct TelegramConfig {
     /// Minimum interval (ms) between draft message edits to avoid rate limits.
     #[serde(default = "default_draft_update_interval_ms")]
     pub draft_update_interval_ms: u64,
+    /// When true, a newer Telegram message from the same sender in the same chat
+    /// cancels the in-flight request and starts a fresh response with preserved history.
+    #[serde(default)]
+    pub interrupt_on_new_message: bool,
     /// When true, only respond to messages that @-mention the bot in groups.
     /// Direct messages are always processed.
     #[serde(default)]
@@ -2906,6 +2910,7 @@ impl Config {
                 decrypt_optional_secret(&store, &mut agent.api_key, "config.agents.*.api_key")?;
             }
             config.apply_env_overrides();
+            config.validate()?;
             tracing::info!(
                 path = %config.config_path.display(),
                 workspace = %config.workspace_dir.display(),
@@ -2928,6 +2933,7 @@ impl Config {
             }
 
             config.apply_env_overrides();
+            config.validate()?;
             tracing::info!(
                 path = %config.config_path.display(),
                 workspace = %config.workspace_dir.display(),
@@ -2937,6 +2943,61 @@ impl Config {
             );
             Ok(config)
         }
+    }
+
+    /// Validate configuration values that would cause runtime failures.
+    ///
+    /// Called after TOML deserialization and env-override application to catch
+    /// obviously invalid values early instead of failing at arbitrary runtime points.
+    pub fn validate(&self) -> Result<()> {
+        // Gateway
+        if self.gateway.host.trim().is_empty() {
+            anyhow::bail!("gateway.host must not be empty");
+        }
+
+        // Autonomy
+        if self.autonomy.max_actions_per_hour == 0 {
+            anyhow::bail!("autonomy.max_actions_per_hour must be greater than 0");
+        }
+
+        // Scheduler
+        if self.scheduler.max_concurrent == 0 {
+            anyhow::bail!("scheduler.max_concurrent must be greater than 0");
+        }
+        if self.scheduler.max_tasks == 0 {
+            anyhow::bail!("scheduler.max_tasks must be greater than 0");
+        }
+
+        // Model routes
+        for (i, route) in self.model_routes.iter().enumerate() {
+            if route.hint.trim().is_empty() {
+                anyhow::bail!("model_routes[{i}].hint must not be empty");
+            }
+            if route.provider.trim().is_empty() {
+                anyhow::bail!("model_routes[{i}].provider must not be empty");
+            }
+            if route.model.trim().is_empty() {
+                anyhow::bail!("model_routes[{i}].model must not be empty");
+            }
+        }
+
+        // Embedding routes
+        for (i, route) in self.embedding_routes.iter().enumerate() {
+            if route.hint.trim().is_empty() {
+                anyhow::bail!("embedding_routes[{i}].hint must not be empty");
+            }
+            if route.provider.trim().is_empty() {
+                anyhow::bail!("embedding_routes[{i}].provider must not be empty");
+            }
+            if route.model.trim().is_empty() {
+                anyhow::bail!("embedding_routes[{i}].model must not be empty");
+            }
+        }
+
+        // Proxy (delegate to existing validation)
+        self.proxy.validate()?;
+
+        Ok(())
     }
 
     /// Apply environment variable overrides to config
@@ -3520,6 +3581,7 @@ default_temperature = 0.7
                     allowed_users: vec!["user1".into()],
                     stream_mode: StreamMode::default(),
                     draft_update_interval_ms: default_draft_update_interval_ms(),
+                    interrupt_on_new_message: false,
                     mention_only: false,
                 }),
                 discord: None,
@@ -3852,6 +3914,7 @@ tool_dispatcher = "xml"
             allowed_users: vec!["alice".into(), "bob".into()],
             stream_mode: StreamMode::Partial,
             draft_update_interval_ms: 500,
+            interrupt_on_new_message: true,
             mention_only: false,
         };
         let json = serde_json::to_string(&tc).unwrap();
@@ -3860,6 +3923,7 @@ tool_dispatcher = "xml"
         assert_eq!(parsed.allowed_users.len(), 2);
         assert_eq!(parsed.stream_mode, StreamMode::Partial);
         assert_eq!(parsed.draft_update_interval_ms, 500);
+        assert!(parsed.interrupt_on_new_message);
     }
 
     #[test]
@@ -3868,6 +3932,7 @@ tool_dispatcher = "xml"
         let parsed: TelegramConfig = serde_json::from_str(json).unwrap();
         assert_eq!(parsed.stream_mode, StreamMode::Off);
         assert_eq!(parsed.draft_update_interval_ms, 1000);
+        assert!(!parsed.interrupt_on_new_message);
     }
 
     #[test]
@@ -4411,6 +4476,17 @@ default_temperature = 0.7
     async fn composio_config_partial_toml() {
         let toml_str = r"
 enabled = true
+";
+        let parsed: ComposioConfig = toml::from_str(toml_str).unwrap();
+        assert!(parsed.enabled);
+        assert!(parsed.api_key.is_none());
+        assert_eq!(parsed.entity_id, "default");
+    }
+
+    #[test]
+    async fn composio_config_enable_alias_supported() {
+        let toml_str = r"
+enable = true
 ";
         let parsed: ComposioConfig = toml::from_str(toml_str).unwrap();
         assert!(parsed.enabled);

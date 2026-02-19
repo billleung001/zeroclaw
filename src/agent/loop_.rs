@@ -16,6 +16,7 @@ use std::fmt::Write;
 use std::io::Write as _;
 use std::sync::{Arc, LazyLock};
 use std::time::Instant;
+use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
 /// Minimum characters per chunk when relaying LLM text to a streaming draft.
@@ -226,9 +227,16 @@ async fn build_context(mem: &dyn Memory, user_msg: &str, min_relevance_score: f6
         if !relevant.is_empty() {
             context.push_str("[Memory context]\n");
             for entry in &relevant {
+                if memory::is_assistant_autosave_key(&entry.key) {
+                    continue;
+                }
                 let _ = writeln!(context, "- {}: {}", entry.key, entry.content);
             }
-            context.push('\n');
+            if context != "[Memory context]\n" {
+                context.push('\n');
+            } else {
+                context.clear();
+            }
         }
     }
 
@@ -816,6 +824,21 @@ struct ParsedToolCall {
     arguments: serde_json::Value,
 }
 
+#[derive(Debug)]
+pub(crate) struct ToolLoopCancelled;
+
+impl std::fmt::Display for ToolLoopCancelled {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("tool loop cancelled")
+    }
+}
+
+impl std::error::Error for ToolLoopCancelled {}
+
+pub(crate) fn is_tool_loop_cancelled(err: &anyhow::Error) -> bool {
+    err.chain().any(|source| source.is::<ToolLoopCancelled>())
+}
+
 /// Execute a single turn of the agent loop: send messages, parse tool calls,
 /// execute tools, and loop until the LLM produces a final text response.
 /// When `silent` is true, suppresses stdout (for channel use).
@@ -846,6 +869,7 @@ pub(crate) async fn agent_turn(
         multimodal_config,
         max_tool_iterations,
         None,
+        None,
     )
     .await
 }
@@ -866,6 +890,7 @@ pub(crate) async fn run_tool_call_loop(
     channel_name: &str,
     multimodal_config: &crate::config::MultimodalConfig,
     max_tool_iterations: usize,
+    cancellation_token: Option<CancellationToken>,
     on_delta: Option<tokio::sync::mpsc::Sender<String>>,
 ) -> Result<String> {
     let max_iterations = if max_tool_iterations == 0 {
@@ -879,6 +904,13 @@ pub(crate) async fn run_tool_call_loop(
     let use_native_tools = provider.supports_native_tools() && !tool_specs.is_empty();
 
     for _iteration in 0..max_iterations {
+        if cancellation_token
+            .as_ref()
+            .is_some_and(CancellationToken::is_cancelled)
+        {
+            return Err(ToolLoopCancelled.into());
+        }
+
         let image_marker_count = multimodal::count_image_markers(history);
         if image_marker_count > 0 && !provider.supports_vision() {
             return Err(ProviderCapabilityError {
@@ -910,18 +942,26 @@ pub(crate) async fn run_tool_call_loop(
             None
         };
 
+        let chat_future = provider.chat(
+            ChatRequest {
+                messages: &prepared_messages.messages,
+                tools: request_tools,
+            },
+            model,
+            temperature,
+        );
+
+        let chat_result = if let Some(token) = cancellation_token.as_ref() {
+            tokio::select! {
+                () = token.cancelled() => return Err(ToolLoopCancelled.into()),
+                result = chat_future => result,
+            }
+        } else {
+            chat_future.await
+        };
+
         let (response_text, parsed_text, tool_calls, assistant_history_content, native_tool_calls) =
-            match provider
-                .chat(
-                    ChatRequest {
-                        messages: &prepared_messages.messages,
-                        tools: request_tools,
-                    },
-                    model,
-                    temperature,
-                )
-                .await
-            {
+            match chat_result {
                 Ok(resp) => {
                     observer.record_event(&ObserverEvent::LlmResponse {
                         provider: provider_name.to_string(),
@@ -987,6 +1027,12 @@ pub(crate) async fn run_tool_call_loop(
                 // STREAM_CHUNK_MIN_CHARS characters for progressive draft updates.
                 let mut chunk = String::new();
                 for word in display_text.split_inclusive(char::is_whitespace) {
+                    if cancellation_token
+                        .as_ref()
+                        .is_some_and(CancellationToken::is_cancelled)
+                    {
+                        return Err(ToolLoopCancelled.into());
+                    }
                     chunk.push_str(word);
                     if chunk.len() >= STREAM_CHUNK_MIN_CHARS
                         && tx.send(std::mem::take(&mut chunk)).await.is_err()
@@ -1049,7 +1095,17 @@ pub(crate) async fn run_tool_call_loop(
             });
             let start = Instant::now();
             let result = if let Some(tool) = find_tool(tools_registry, &call.name) {
-                match tool.execute(call.arguments.clone()).await {
+                let tool_future = tool.execute(call.arguments.clone());
+                let tool_result = if let Some(token) = cancellation_token.as_ref() {
+                    tokio::select! {
+                        () = token.cancelled() => return Err(ToolLoopCancelled.into()),
+                        result = tool_future => result,
+                    }
+                } else {
+                    tool_future.await
+                };
+
+                match tool_result {
                     Ok(r) => {
                         observer.record_event(&ObserverEvent::ToolCall {
                             tool: call.name.clone(),
@@ -1428,20 +1484,12 @@ pub async fn run(
             &config.multimodal,
             config.agent.max_tool_iterations,
             None,
+            None,
         )
         .await?;
         final_output = response.clone();
         println!("{response}");
         observer.record_event(&ObserverEvent::TurnComplete);
-
-        // Auto-save assistant response to daily log
-        if config.memory.auto_save {
-            let summary = truncate_with_ellipsis(&response, 100);
-            let response_key = autosave_memory_key("assistant_resp");
-            let _ = mem
-                .store(&response_key, &summary, MemoryCategory::Daily, None)
-                .await;
-        }
     } else {
         println!("🦀 ZeroClaw Interactive Mode");
         println!("Type /help for commands.\n");
@@ -1555,6 +1603,7 @@ pub async fn run(
                 &config.multimodal,
                 config.agent.max_tool_iterations,
                 None,
+                None,
             )
             .await
             {
@@ -1591,14 +1640,6 @@ pub async fn run(
 
             // Hard cap as a safety net.
             trim_history(&mut history, config.agent.max_history_messages);
-
-            if config.memory.auto_save {
-                let summary = truncate_with_ellipsis(&response, 100);
-                let response_key = autosave_memory_key("assistant_resp");
-                let _ = mem
-                    .store(&response_key, &summary, MemoryCategory::Daily, None)
-                    .await;
-            }
         }
     }
 
@@ -1910,6 +1951,7 @@ mod tests {
             &crate::config::MultimodalConfig::default(),
             3,
             None,
+            None,
         )
         .await
         .expect_err("provider without vision support should fail");
@@ -1953,6 +1995,7 @@ mod tests {
             &multimodal,
             3,
             None,
+            None,
         )
         .await
         .expect_err("oversized payload must fail");
@@ -1989,6 +2032,7 @@ mod tests {
             "cli",
             &crate::config::MultimodalConfig::default(),
             3,
+            None,
             None,
         )
         .await
@@ -2441,6 +2485,33 @@ Done."#;
         assert!(recalled.iter().any(|entry| entry.content.contains("45")));
     }
 
+    #[tokio::test]
+    async fn build_context_ignores_legacy_assistant_autosave_entries() {
+        let tmp = TempDir::new().unwrap();
+        let mem = SqliteMemory::new(tmp.path()).unwrap();
+        mem.store(
+            "assistant_resp_poisoned",
+            "User suffered a fabricated event",
+            MemoryCategory::Daily,
+            None,
+        )
+        .await
+        .unwrap();
+        mem.store(
+            "user_msg_real",
+            "User asked for concise status updates",
+            MemoryCategory::Conversation,
+            None,
+        )
+        .await
+        .unwrap();
+
+        let context = build_context(&mem, "status updates", 0.0).await;
+        assert!(context.contains("user_msg_real"));
+        assert!(!context.contains("assistant_resp_poisoned"));
+        assert!(!context.contains("fabricated event"));
+    }
+
     // ═══════════════════════════════════════════════════════════════════════
     // Recovery Tests - Tool Call Parsing Edge Cases
     // ═══════════════════════════════════════════════════════════════════════
@@ -2736,5 +2807,196 @@ browser_open/url>https://example.com"#;
         assert_eq!(calls[0].name, "shell");
         assert_eq!(calls[0].arguments["command"], "pwd");
         assert_eq!(text, "Done");
+    }
+
+    // ─────────────────────────────────────────────────────────────────────
+    // TG4 (inline): parse_tool_calls robustness — malformed/edge-case inputs
+    // Prevents: Pattern 4 issues #746, #418, #777, #848
+    // ─────────────────────────────────────────────────────────────────────
+
+    #[test]
+    fn parse_tool_calls_empty_input_returns_empty() {
+        let (text, calls) = parse_tool_calls("");
+        assert!(calls.is_empty(), "empty input should produce no tool calls");
+        assert!(text.is_empty(), "empty input should produce no text");
+    }
+
+    #[test]
+    fn parse_tool_calls_whitespace_only_returns_empty_calls() {
+        let (text, calls) = parse_tool_calls("   \n\t  ");
+        assert!(calls.is_empty());
+        assert!(text.is_empty() || text.trim().is_empty());
+    }
+
+    #[test]
+    fn parse_tool_calls_nested_xml_tags_handled() {
+        // Double-wrapped tool call should still parse the inner call
+        let response = r#"<tool_call><tool_call>{"name":"echo","arguments":{"msg":"hi"}}</tool_call></tool_call>"#;
+        let (_text, calls) = parse_tool_calls(response);
+        // Should find at least one tool call
+        assert!(
+            !calls.is_empty(),
+            "nested XML tags should still yield at least one tool call"
+        );
+    }
+
+    #[test]
+    fn parse_tool_calls_truncated_json_no_panic() {
+        // Incomplete JSON inside tool_call tags
+        let response = r#"<tool_call>{"name":"shell","arguments":{"command":"ls"</tool_call>"#;
+        let (_text, _calls) = parse_tool_calls(response);
+        // Should not panic — graceful handling of truncated JSON
+    }
+
+    #[test]
+    fn parse_tool_calls_empty_json_object_in_tag() {
+        let response = "<tool_call>{}</tool_call>";
+        let (_text, calls) = parse_tool_calls(response);
+        // Empty JSON object has no name field — should not produce valid tool call
+        assert!(
+            calls.is_empty(),
+            "empty JSON object should not produce a tool call"
+        );
+    }
+
+    #[test]
+    fn parse_tool_calls_closing_tag_only_returns_text() {
+        let response = "Some text </tool_call> more text";
+        let (text, calls) = parse_tool_calls(response);
+        assert!(
+            calls.is_empty(),
+            "closing tag only should not produce calls"
+        );
+        assert!(
+            !text.is_empty(),
+            "text around orphaned closing tag should be preserved"
+        );
+    }
+
+    #[test]
+    fn parse_tool_calls_very_large_arguments_no_panic() {
+        let large_arg = "x".repeat(100_000);
+        let response = format!(
+            r#"<tool_call>{{"name":"echo","arguments":{{"message":"{}"}}}}</tool_call>"#,
+            large_arg
+        );
+        let (_text, calls) = parse_tool_calls(&response);
+        assert_eq!(calls.len(), 1, "large arguments should still parse");
+        assert_eq!(calls[0].name, "echo");
+    }
+
+    #[test]
+    fn parse_tool_calls_special_characters_in_arguments() {
+        let response = r#"<tool_call>{"name":"echo","arguments":{"message":"hello \"world\" <>&'\n\t"}}</tool_call>"#;
+        let (_text, calls) = parse_tool_calls(response);
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].name, "echo");
+    }
+
+    #[test]
+    fn parse_tool_calls_text_with_embedded_json_not_extracted() {
+        // Raw JSON without any tags should NOT be extracted as a tool call
+        let response = r#"Here is some data: {"name":"echo","arguments":{"message":"hi"}} end."#;
+        let (_text, calls) = parse_tool_calls(response);
+        assert!(
+            calls.is_empty(),
+            "raw JSON in text without tags should not be extracted"
+        );
+    }
+
+    #[test]
+    fn parse_tool_calls_multiple_formats_mixed() {
+        // Mix of text and properly tagged tool call
+        let response = r#"I'll help you with that.
+
+<tool_call>
+{"name":"shell","arguments":{"command":"echo hello"}}
+</tool_call>
+
+Let me check the result."#;
+        let (text, calls) = parse_tool_calls(response);
+        assert_eq!(
+            calls.len(),
+            1,
+            "should extract one tool call from mixed content"
+        );
+        assert_eq!(calls[0].name, "shell");
+        assert!(
+            text.contains("help you"),
+            "text before tool call should be preserved"
+        );
+    }
+
+    // ─────────────────────────────────────────────────────────────────────
+    // TG4 (inline): scrub_credentials edge cases
+    // ─────────────────────────────────────────────────────────────────────
+
+    #[test]
+    fn scrub_credentials_empty_input() {
+        let result = scrub_credentials("");
+        assert_eq!(result, "");
+    }
+
+    #[test]
+    fn scrub_credentials_no_sensitive_data() {
+        let input = "normal text without any secrets";
+        let result = scrub_credentials(input);
+        assert_eq!(
+            result, input,
+            "non-sensitive text should pass through unchanged"
+        );
+    }
+
+    #[test]
+    fn scrub_credentials_short_values_not_redacted() {
+        // Values shorter than 8 chars should not be redacted
+        let input = r#"api_key="short""#;
+        let result = scrub_credentials(input);
+        assert_eq!(result, input, "short values should not be redacted");
+    }
+
+    // ─────────────────────────────────────────────────────────────────────
+    // TG4 (inline): trim_history edge cases
+    // ─────────────────────────────────────────────────────────────────────
+
+    #[test]
+    fn trim_history_empty_history() {
+        let mut history: Vec<crate::providers::ChatMessage> = vec![];
+        trim_history(&mut history, 10);
+        assert!(history.is_empty());
+    }
+
+    #[test]
+    fn trim_history_system_only() {
+        let mut history = vec![crate::providers::ChatMessage::system("system prompt")];
+        trim_history(&mut history, 10);
+        assert_eq!(history.len(), 1);
+        assert_eq!(history[0].role, "system");
+    }
+
+    #[test]
+    fn trim_history_exactly_at_limit() {
+        let mut history = vec![
+            crate::providers::ChatMessage::system("system"),
+            crate::providers::ChatMessage::user("msg 1"),
+            crate::providers::ChatMessage::assistant("reply 1"),
+        ];
+        trim_history(&mut history, 2); // 2 non-system messages = exactly at limit
+        assert_eq!(history.len(), 3, "should not trim when exactly at limit");
+    }
+
+    #[test]
+    fn trim_history_removes_oldest_non_system() {
+        let mut history = vec![
+            crate::providers::ChatMessage::system("system"),
+            crate::providers::ChatMessage::user("old msg"),
+            crate::providers::ChatMessage::assistant("old reply"),
+            crate::providers::ChatMessage::user("new msg"),
+            crate::providers::ChatMessage::assistant("new reply"),
+        ];
+        trim_history(&mut history, 2);
+        assert_eq!(history.len(), 3); // system + 2 kept
+        assert_eq!(history[0].role, "system");
+        assert_eq!(history[1].content, "new msg");
     }
 }
