@@ -223,6 +223,8 @@ tempfile = "3.14"
 criterion = { version = "0.8", features = ["async_tokio"] }
 tokio-stream = { version = "0.1.18", default-features = false, features = ["fs"] }
 
-[[bench]]
-name = "agent_benchmarks"
-harness = false
+[[bench]]  
+name = "agent_benchmarks"  
+path = "benches/agent_benchmarks.rs"  
+harness = false  
+
